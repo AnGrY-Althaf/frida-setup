@@ -7,7 +7,9 @@
     - Installs Python (via winget, Chocolatey, or Microsoft Store) if not present
     - Installs Frida, frida-tools, and objection via pip
     - Downloads Android platform-tools and adds to PATH
-    - Downloads frida-server for Android
+    - Auto-detects connected Android device architecture (arm, arm64, x86, x86_64)
+    - Downloads the correct frida-server for the detected architecture
+    - Installs 7-Zip portable if needed for .xz extraction
     - Pushes frida-server to connected Android device via adb
 .NOTES
     Run this script in PowerShell as Administrator for best results.
@@ -17,7 +19,7 @@
 param(
     [string]$FridaVersion = "15.2.2",
     [string]$FridaToolsVersion = "10.4.1",
-    [string]$AndroidArch = "x86_64"  # Options: arm, arm64, x86, x86_64
+    [string]$AndroidArch = ""  # Auto-detect if empty. Options: arm, arm64, x86, x86_64
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,11 +35,90 @@ $DocumentsFolder = [Environment]::GetFolderPath("MyDocuments")
 $PlatformToolsPath = Join-Path $DocumentsFolder "platform-tools"
 $CurrentFolder = $PSScriptRoot
 if (-not $CurrentFolder) { $CurrentFolder = Get-Location }
-$FridaServerFile = "frida-server-$FridaVersion-android-$AndroidArch"
-$FridaServerXZ = "$FridaServerFile.xz"
-$FridaServerURL = "https://github.com/frida/frida/releases/download/$FridaVersion/$FridaServerXZ"
 $PlatformToolsURL = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
 $PlatformToolsZip = Join-Path $env:TEMP "platform-tools.zip"
+$7ZipPortablePath = Join-Path $env:TEMP "7za.exe"
+
+# ============================================
+# Helper Function: Get or Install 7-Zip
+# ============================================
+function Get-7ZipPath {
+    # Check if 7-Zip is already installed
+    $7zipLocations = @(
+        "C:\Program Files\7-Zip\7z.exe",
+        "C:\Program Files (x86)\7-Zip\7z.exe"
+    )
+
+    foreach ($loc in $7zipLocations) {
+        if (Test-Path $loc) {
+            return $loc
+        }
+    }
+
+    # Check if 7za portable exists in temp
+    if (Test-Path $7ZipPortablePath) {
+        return $7ZipPortablePath
+    }
+
+    # Try to find 7z in PATH
+    try {
+        $cmd = Get-Command 7z -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+    } catch { }
+
+    return $null
+}
+
+function Install-7ZipPortable {
+    Write-Status "Downloading 7-Zip portable for .xz extraction..."
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+        # Download 7-Zip standalone console version (7zr.exe supports .xz)
+        $7zrUrl = "https://github.com/ip7z/7zip/releases/download/24.08/7zr.exe"
+
+        Invoke-WebRequest -Uri $7zrUrl -OutFile $7ZipPortablePath -UseBasicParsing
+        if (Test-Path $7ZipPortablePath) {
+            Write-Success "Downloaded 7-Zip portable"
+            return $7ZipPortablePath
+        }
+    } catch {
+        Write-Warning "Failed to download 7-Zip portable: $_"
+    }
+
+    return $null
+}
+
+# ============================================
+# Helper Function: Detect Android Architecture
+# ============================================
+function Get-AndroidArchitecture {
+    param([string]$AdbPath)
+
+    try {
+        $abi = & $AdbPath shell getprop ro.product.cpu.abi 2>&1
+        $abi = $abi.Trim()
+
+        Write-Status "Detected device ABI: $abi"
+
+        # Map Android ABI to Frida architecture names
+        switch -Regex ($abi) {
+            "^arm64-v8a" { return "arm64" }
+            "^armeabi-v7a" { return "arm" }
+            "^armeabi" { return "arm" }
+            "^x86_64" { return "x86_64" }
+            "^x86" { return "x86" }
+            default {
+                Write-Warning "Unknown ABI: $abi, defaulting to arm64"
+                return "arm64"
+            }
+        }
+    } catch {
+        Write-Warning "Could not detect device architecture: $_"
+        return $null
+    }
+}
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Magenta
@@ -347,8 +428,61 @@ if (-not $currentUserPath.Contains($PlatformToolsPath)) {
 }
 
 # ============================================
-# Step 5: Download Frida Server
+# Step 5: Detect Device Architecture & Download Frida Server
 # ============================================
+$adbExe = Join-Path $PlatformToolsPath "adb.exe"
+if (-not (Test-Path $adbExe)) {
+    $adbExe = "adb"  # Try PATH
+}
+
+# Auto-detect architecture if not specified
+if (-not $AndroidArch) {
+    Write-Status "Detecting Android device architecture..."
+
+    try {
+        $devices = & $adbExe devices 2>&1
+        $connectedDevices = $devices | Select-String -Pattern "device$" | Where-Object { $_ -notmatch "List" }
+
+        if ($connectedDevices) {
+            $detectedArch = Get-AndroidArchitecture -AdbPath $adbExe
+            if ($detectedArch) {
+                $AndroidArch = $detectedArch
+                Write-Success "Detected architecture: $AndroidArch"
+            } else {
+                Write-Warning "Could not detect architecture, defaulting to arm64"
+                $AndroidArch = "arm64"
+            }
+        } else {
+            Write-Warning "No Android device connected. Please specify architecture manually."
+            Write-Host ""
+            Write-Host "Available architectures:" -ForegroundColor Yellow
+            Write-Host "  1. arm64  (most modern phones)" -ForegroundColor White
+            Write-Host "  2. arm    (older 32-bit phones)" -ForegroundColor White
+            Write-Host "  3. x86_64 (emulators, some tablets)" -ForegroundColor White
+            Write-Host "  4. x86    (older emulators)" -ForegroundColor White
+            Write-Host ""
+
+            $archChoice = Read-Host "Select architecture (1-4) or press Enter for arm64"
+            switch ($archChoice) {
+                "1" { $AndroidArch = "arm64" }
+                "2" { $AndroidArch = "arm" }
+                "3" { $AndroidArch = "x86_64" }
+                "4" { $AndroidArch = "x86" }
+                default { $AndroidArch = "arm64" }
+            }
+            Write-Status "Using architecture: $AndroidArch"
+        }
+    } catch {
+        Write-Warning "Could not communicate with adb. Defaulting to arm64."
+        $AndroidArch = "arm64"
+    }
+}
+
+# Set Frida server variables based on detected/selected architecture
+$FridaServerFile = "frida-server-$FridaVersion-android-$AndroidArch"
+$FridaServerXZ = "$FridaServerFile.xz"
+$FridaServerURL = "https://github.com/frida/frida/releases/download/$FridaVersion/$FridaServerXZ"
+
 Write-Status "Downloading Frida Server v$FridaVersion for Android $AndroidArch..."
 
 $fridaServerPath = Join-Path $CurrentFolder "frida-server"
@@ -364,49 +498,54 @@ if (Test-Path $fridaServerPath) {
         Invoke-WebRequest -Uri $FridaServerURL -OutFile $fridaServerXZPath -UseBasicParsing
         Write-Success "Downloaded Frida Server"
 
-        # Extract .xz file
+        # Extract .xz file - Windows tar does NOT support .xz, must use 7-Zip
         Write-Status "Extracting Frida Server..."
 
-        # Check if 7-Zip is available
-        $7zipPath = $null
-        $7zipLocations = @(
-            "C:\Program Files\7-Zip\7z.exe",
-            "C:\Program Files (x86)\7-Zip\7z.exe",
-            (Get-Command 7z -ErrorAction SilentlyContinue).Source
-        )
+        # Get or install 7-Zip
+        $7zipPath = Get-7ZipPath
 
-        foreach ($loc in $7zipLocations) {
-            if ($loc -and (Test-Path $loc)) {
-                $7zipPath = $loc
-                break
-            }
+        if (-not $7zipPath) {
+            # Try to install 7-Zip portable
+            $7zipPath = Install-7ZipPortable
+        }
+
+        if (-not $7zipPath) {
+            # Try to install via winget
+            Write-Status "Trying to install 7-Zip via winget..."
+            try {
+                winget install 7zip.7zip --accept-package-agreements --accept-source-agreements 2>$null
+                Start-Sleep -Seconds 2
+                $7zipPath = Get-7ZipPath
+            } catch { }
         }
 
         if ($7zipPath) {
-            & $7zipPath x $fridaServerXZPath -o"$CurrentFolder" -y | Out-Null
-            Rename-Item (Join-Path $CurrentFolder $FridaServerFile) "frida-server" -Force -ErrorAction SilentlyContinue
-            Write-Success "Extracted using 7-Zip"
-        } else {
-            # Try using tar (available in Windows 10+)
-            try {
-                Push-Location $CurrentFolder
-                tar -xf $FridaServerXZ
-                if (Test-Path $FridaServerFile) {
-                    Rename-Item $FridaServerFile "frida-server" -Force
+            Write-Status "Using 7-Zip: $7zipPath"
+            $extractResult = & $7zipPath x $fridaServerXZPath -o"$CurrentFolder" -y 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                # Rename extracted file to frida-server
+                $extractedFile = Join-Path $CurrentFolder $FridaServerFile
+                if (Test-Path $extractedFile) {
+                    Rename-Item $extractedFile "frida-server" -Force
                 }
-                Pop-Location
-                Write-Success "Extracted using tar"
-            } catch {
-                Write-Warning "Could not extract .xz file automatically"
-                Write-Warning "Please install 7-Zip from https://www.7-zip.org/"
-                Write-Warning "Or manually extract: $fridaServerXZPath"
-                Write-Warning "Then rename the extracted file to 'frida-server'"
-            }
-        }
+                Write-Success "Extracted Frida Server successfully"
 
-        # Clean up .xz file
-        if (Test-Path $fridaServerPath) {
-            Remove-Item $fridaServerXZPath -Force -ErrorAction SilentlyContinue
+                # Clean up .xz file
+                Remove-Item $fridaServerXZPath -Force -ErrorAction SilentlyContinue
+            } else {
+                Write-Error "7-Zip extraction failed: $extractResult"
+            }
+        } else {
+            Write-Error "Could not find or install 7-Zip!"
+            Write-Host ""
+            Write-Host "Please install 7-Zip manually:" -ForegroundColor Yellow
+            Write-Host "  1. Download from https://www.7-zip.org/" -ForegroundColor White
+            Write-Host "  2. Install it" -ForegroundColor White
+            Write-Host "  3. Run this script again" -ForegroundColor White
+            Write-Host ""
+            Write-Host "Or manually extract:" -ForegroundColor Yellow
+            Write-Host "  File: $fridaServerXZPath" -ForegroundColor White
+            Write-Host "  Rename extracted file to: frida-server" -ForegroundColor White
         }
 
     } catch {
@@ -419,11 +558,6 @@ if (Test-Path $fridaServerPath) {
 # Step 6: Push Frida Server to Android Device
 # ============================================
 Write-Status "Checking for connected Android device..."
-
-$adbExe = Join-Path $PlatformToolsPath "adb.exe"
-if (-not (Test-Path $adbExe)) {
-    $adbExe = "adb"  # Try PATH
-}
 
 try {
     $devices = & $adbExe devices 2>&1
@@ -487,9 +621,11 @@ Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "            Installation Summary       " -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Python Scripts Path: Added to USER PATH" -ForegroundColor White
-Write-Host "Platform Tools: $PlatformToolsPath" -ForegroundColor White
-Write-Host "Frida Server: $fridaServerPath" -ForegroundColor White
+Write-Host "Frida Version:      $FridaVersion" -ForegroundColor White
+Write-Host "Device Architecture: $AndroidArch" -ForegroundColor White
+Write-Host "Python Scripts:      Added to USER PATH" -ForegroundColor White
+Write-Host "Platform Tools:      $PlatformToolsPath" -ForegroundColor White
+Write-Host "Frida Server:        $fridaServerPath" -ForegroundColor White
 Write-Host ""
 Write-Warning "Remember to open a NEW terminal to use the updated PATH!"
 Write-Host ""
