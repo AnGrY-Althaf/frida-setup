@@ -1,11 +1,12 @@
 # Frida Auto Setup
 
-Automated setup scripts for [Frida](https://frida.re/) on Windows and Linux. These scripts handle the entire setup process including Python installation, Frida tools, Android platform-tools, and frida-server deployment.
+Automated setup scripts for [Frida](https://frida.re/) on Windows, Linux, and macOS. These scripts handle the entire setup process including Python installation, Frida tools, Android platform-tools, and frida-server deployment.
 
 ## Features
 
 - **Automatic Python Installation** - Installs Python if not present
-- **Python Environment Setup** (Linux) - Handles PATH, `~/.local/bin`, build dependencies, and pip issues
+- **Python Environment Setup** (Linux/macOS) - Handles PATH, `~/.local/bin` / `~/Library/Python/<ver>/bin`, build dependencies, and pip issues
+- **Homebrew Installation** (macOS) - Installs Homebrew if not present and uses it to manage dependencies
 - **Multiple Install Methods** (Linux) - Tries `--user`, system-level, `--break-system-packages`, and venv fallback
 - **Frida Tools Installation** - Installs `frida`, `frida-tools`, and `objection` via pip
 - **Platform Tools Setup** - Downloads and configures Android platform-tools (adb)
@@ -21,7 +22,7 @@ Automated setup scripts for [Frida](https://frida.re/) on Windows and Linux. The
 | Linux (Debian/Ubuntu) | `frida-setup.sh` | ✅ |
 | Linux (Fedora/RHEL) | `frida-setup.sh` | ✅ |
 | Linux (Arch) | `frida-setup.sh` | ✅ |
-| macOS | - | Coming Soon |
+| macOS (Intel & Apple Silicon) | `frida-setup-macos.sh` | ✅ |
 
 ## Quick Start
 
@@ -29,7 +30,7 @@ Automated setup scripts for [Frida](https://frida.re/) on Windows and Linux. The
 
 ```powershell
 # Clone the repository
-git clone https://github.com/yourusername/frida-setup.git
+git clone https://github.com/AnGrY-Althaf/frida-setup.git
 cd frida-setup
 
 # Run the script (recommended: Run as Administrator)
@@ -40,12 +41,24 @@ cd frida-setup
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/frida-setup.git
+git clone https://github.com/AnGrY-Althaf/frida-setup.git
 cd frida-setup
 
 # Make executable and run
 chmod +x frida-setup.sh
 ./frida-setup.sh
+```
+
+### macOS
+
+```bash
+# Clone the repository
+git clone https://github.com/AnGrY-Althaf/frida-setup.git
+cd frida-setup
+
+# Make executable and run
+chmod +x frida-setup-macos.sh
+./frida-setup-macos.sh
 ```
 
 ## Usage
@@ -102,6 +115,27 @@ chmod +x frida-setup.sh
 | `--arch` | `-a` | Auto-detect | Target architecture |
 | `--help` | `-h` | - | Show help message |
 
+### macOS (Bash/Zsh)
+
+```bash
+# Auto-detect everything (device must be connected)
+./frida-setup-macos.sh
+
+# Specify architecture manually
+./frida-setup-macos.sh -a arm64
+
+# Custom Frida version
+./frida-setup-macos.sh -v 16.0.0 -t 12.0.0
+
+# Full custom setup
+./frida-setup-macos.sh --frida-version 15.2.2 --tools-version 10.4.1 --arch x86_64
+
+# Show help
+./frida-setup-macos.sh --help
+```
+
+**Options:** Same flags as Linux (`-v`, `-t`, `-a`, `-h`).
+
 ## Android Architecture Guide
 
 | Architecture | Description | Common Devices |
@@ -139,6 +173,19 @@ adb shell getprop ro.product.cpu.abi
 | frida-server | Script directory |
 
 **Note:** On modern Linux distributions with PEP 668, the script may create a virtual environment at `~/.frida-venv` and auto-activate it in your shell configuration.
+
+### macOS
+
+| Component | Location |
+|-----------|----------|
+| Homebrew | `/opt/homebrew` (Apple Silicon) or `/usr/local` (Intel) |
+| Python | Homebrew (`brew install python`) |
+| Frida tools | `~/Library/Python/<ver>/bin` (added to PATH) |
+| Frida venv (fallback) | `~/.frida-venv` (if pip --user fails) |
+| Platform Tools | `~/platform-tools` |
+| frida-server | Script directory |
+
+**Note:** The macOS script automatically removes the Gatekeeper quarantine attribute (`xattr -cr`) from the downloaded Platform Tools so that `adb` runs without security pop-ups.
 
 ## Post-Installation
 
@@ -267,6 +314,12 @@ adb shell "su -c setenforce 0"
 - Any modern Linux distribution
 - Bash shell
 - `sudo` access (for package installation)
+- USB debugging enabled on Android device
+
+### macOS
+- macOS 11 Big Sur or later (Intel or Apple Silicon)
+- Bash or Zsh shell
+- Internet connection (Homebrew/Python/Platform Tools auto-downloaded)
 - USB debugging enabled on Android device
 
 ## Version Compatibility
