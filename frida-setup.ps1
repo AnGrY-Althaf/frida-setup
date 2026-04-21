@@ -135,53 +135,54 @@ public static extern IntPtr SendMessageTimeout(
 # Helper Function: Broad Python Installation Finder
 # Queries Windows Registry (HKLM + HKCU, 32/64-bit)
 # then sweeps every common filesystem location.
-# Returns array of @{ ExePath; Dir; ScriptsDir; Source }
+# Returns List of @{ ExePath; Dir; ScriptsDir; Source }
 # ============================================
 function Find-AllPythonInstallations {
-    $installs  = [System.Collections.Generic.List[hashtable]]::new()
-    $seenDirs  = @{}
+    $installs = [System.Collections.Generic.List[hashtable]]::new()
+    $seenDirs = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
 
-    # ---- helper: register a candidate python.exe ----
-    $register = {
-        param($exePath, $source)
-        $dir = Split-Path $exePath
-        if ($seenDirs[$dir]) { return }
-        if (-not (Test-Path $exePath)) { return }
+    # Inline helper — adds a python.exe candidate if it's Python 3 and not seen yet
+    function Register-PythonExe {
+        param([string]$ExePath, [string]$Source)
+        if (-not $ExePath -or -not (Test-Path $ExePath -PathType Leaf)) { return }
+        $dir = Split-Path $ExePath
+        if (-not $seenDirs.Add($dir)) { return }   # .Add() returns $false if already present
         try {
-            $v = & $exePath --version 2>&1
+            $v = & $ExePath --version 2>&1
             if ($v -match 'Python 3') {
-                $seenDirs[$dir] = $true
-                $installs.Add(@{
-                    ExePath    = $exePath
+                $script:installs.Add(@{
+                    ExePath    = $ExePath
                     Dir        = $dir
-                    ScriptsDir = Join-Path $dir 'Scripts'
-                    Source     = $source
+                    ScriptsDir = (Join-Path $dir 'Scripts')
+                    Source     = $Source
                 })
+            } else {
+                $null = $seenDirs.Remove($dir)   # revert so a later python3.exe can try the same dir
             }
         } catch {}
     }
 
     # --------------------------------------------------
-    # 1. Windows Registry  (most authoritative)
+    # 1. Windows Registry (most authoritative)
     # --------------------------------------------------
-    $regPaths = @(
-        'HKLM:\SOFTWARE\Python\PythonCore',              # 64-bit installs
-        'HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore',  # 32-bit installs on 64-bit OS
-        'HKCU:\SOFTWARE\Python\PythonCore'               # per-user installs
+    $regRoots = @(
+        'HKLM:\SOFTWARE\Python\PythonCore',             # 64-bit installs
+        'HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore', # 32-bit on 64-bit OS
+        'HKCU:\SOFTWARE\Python\PythonCore'              # per-user installs
     )
-    foreach ($regRoot in $regPaths) {
+    foreach ($regRoot in $regRoots) {
         if (-not (Test-Path $regRoot)) { continue }
         foreach ($verKey in (Get-ChildItem $regRoot -ErrorAction SilentlyContinue)) {
-            # InstallPath key holds the directory
-            $ipKey = "$($verKey.PSPath)\InstallPath"
-            if (-not (Test-Path $ipKey)) { continue }
-            $ip = Get-ItemProperty $ipKey -ErrorAction SilentlyContinue
-            # '(default)' property or ExecutablePath
+            $ipPath = Join-Path $verKey.PSPath 'InstallPath'
+            if (-not (Test-Path $ipPath)) { continue }
+            $ip  = Get-ItemProperty $ipPath -ErrorAction SilentlyContinue
             $dir = $ip.'(default)'
             if (-not $dir -and $ip.ExecutablePath) { $dir = Split-Path $ip.ExecutablePath }
             if ($dir) {
-                & $register (Join-Path $dir 'python.exe') "Registry: $regRoot"
-                & $register (Join-Path $dir 'python3.exe') "Registry: $regRoot"
+                Register-PythonExe (Join-Path $dir 'python.exe')  "Registry: $regRoot"
+                Register-PythonExe (Join-Path $dir 'python3.exe') "Registry: $regRoot"
             }
         }
     }
@@ -189,33 +190,33 @@ function Find-AllPythonInstallations {
     # --------------------------------------------------
     # 2. Filesystem sweep
     # --------------------------------------------------
-    # Each entry: @(root, filter)  — filter '' means check root itself directly
+    # Use [Environment]::GetEnvironmentVariable for names with special chars like '(x86)'
+    $progFiles   = [Environment]::GetEnvironmentVariable('ProgramFiles')
+    $progFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+    $localAppData = [Environment]::GetEnvironmentVariable('LOCALAPPDATA')
+    $appData      = [Environment]::GetEnvironmentVariable('APPDATA')
+    $userProfile  = [Environment]::GetEnvironmentVariable('USERPROFILE')
+
+    # Each entry: [rootDir, filter]   filter='' means check rootDir itself
     $locations = @(
-        # Standard CPython user installer
-        @("$env:LOCALAPPDATA\Programs\Python", 'Python*'),
-        # All-users CPython installer
-        @($env:PROGRAMFILES,                   'Python*'),
-        @(${env:PROGRAMFILES(x86)},            'Python*'),
-        # Old-style C:\Python3x
-        @('C:\',                               'Python3*'),
-        @('C:\',                               'Python*'),
-        # Scoop
-        @("$env:USERPROFILE\scoop\apps\python\current", ''),
-        @("$env:USERPROFILE\scoop\apps\python3\current", ''),
-        # Chocolatey
-        @('C:\tools',                          'python*'),
-        @('C:\ProgramData\chocolatey\lib',     'python*'),
-        # Conda / Miniconda / Mamba
-        @("$env:USERPROFILE\anaconda3",        ''),
-        @("$env:USERPROFILE\miniconda3",       ''),
-        @("$env:USERPROFILE\mambaforge",       ''),
-        @('C:\ProgramData\Anaconda3',          ''),
-        @('C:\ProgramData\Miniconda3',         ''),
-        @("$env:USERPROFILE\.conda\envs",      '*'),
-        # pyenv-win
-        @("$env:USERPROFILE\.pyenv\pyenv-win\versions", '*'),
-        # Roaming AppData pip --user layout
-        @("$env:APPDATA\Python",               'Python*')
+        @($localAppData + '\Programs\Python',               'Python*'),   # Standard user installer
+        @($progFiles    + '\Python',                        'Python*'),   # All-users (rare prefix)
+        @($progFiles,                                       'Python*'),   # e.g. C:\Program Files\Python312
+        @($progFilesX86,                                    'Python*'),   # 32-bit on 64-bit OS
+        @('C:\',                                            'Python3*'),  # Old-style C:\Python312
+        @('C:\',                                            'Python*'),   # Older C:\Python27 etc
+        @($userProfile + '\scoop\apps\python\current',     ''),          # Scoop
+        @($userProfile + '\scoop\apps\python3\current',    ''),          # Scoop (python3)
+        @('C:\tools',                                       'python*'),   # Chocolatey
+        @('C:\ProgramData\chocolatey\lib',                  'python*'),   # Chocolatey lib
+        @($userProfile + '\anaconda3',                      ''),          # Anaconda
+        @($userProfile + '\miniconda3',                     ''),          # Miniconda
+        @($userProfile + '\mambaforge',                     ''),          # Mambaforge
+        @('C:\ProgramData\Anaconda3',                       ''),          # System Anaconda
+        @('C:\ProgramData\Miniconda3',                      ''),          # System Miniconda
+        @($userProfile + '\.conda\envs',                   '*'),          # Conda envs
+        @($userProfile + '\.pyenv\pyenv-win\versions',     '*'),          # pyenv-win
+        @($appData     + '\Python',                         'Python*')    # Roaming pip --user
     )
 
     foreach ($loc in $locations) {
@@ -224,15 +225,15 @@ function Find-AllPythonInstallations {
         if (-not $root -or -not (Test-Path $root)) { continue }
 
         if ($filter -eq '') {
-            # root is itself a Python install dir
-            & $register (Join-Path $root 'python.exe')  "Filesystem: $root"
-            & $register (Join-Path $root 'python3.exe') "Filesystem: $root"
+            # root is itself a Python install directory
+            Register-PythonExe (Join-Path $root 'python.exe')  "Filesystem: $root"
+            Register-PythonExe (Join-Path $root 'python3.exe') "Filesystem: $root"
         } else {
             $subdirs = Get-ChildItem $root -Filter $filter -Directory -ErrorAction SilentlyContinue |
                        Sort-Object Name -Descending
             foreach ($sub in $subdirs) {
-                & $register (Join-Path $sub.FullName 'python.exe')  "Filesystem: $($sub.FullName)"
-                & $register (Join-Path $sub.FullName 'python3.exe') "Filesystem: $($sub.FullName)"
+                Register-PythonExe (Join-Path $sub.FullName 'python.exe')  "Filesystem: $($sub.FullName)"
+                Register-PythonExe (Join-Path $sub.FullName 'python3.exe') "Filesystem: $($sub.FullName)"
             }
         }
     }
