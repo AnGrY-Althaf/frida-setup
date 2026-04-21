@@ -31,12 +31,104 @@ function Write-Error { param($Message) Write-Host "[-] $Message" -ForegroundColo
 function Write-Warning { param($Message) Write-Host "[!] $Message" -ForegroundColor Yellow }
 
 # ============================================
-# Helper Function: Refresh PATH from registry
+# Helper: Refresh current-session PATH from registry
 # ============================================
 function Refresh-EnvironmentPath {
-    $machinePath = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
-    $userPath    = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-    $env:PATH    = "$machinePath;$userPath"
+    $machine = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
+    $user    = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+    $env:PATH = (@($machine, $user) | Where-Object { $_ }) -join ';'
+    Write-Status "Session PATH refreshed from registry."
+}
+
+# ============================================
+# Helper: Exact PATH token check
+# Splits PATH on ';' and does a case-insensitive
+# exact match (no substring false-positives).
+# ============================================
+function Test-PathContains {
+    param([string]$PathString, [string]$Dir)
+    if (-not $PathString) { return $false }
+    $normalized = $Dir.TrimEnd('\')
+    foreach ($token in ($PathString -split ';')) {
+        if ($token.TrimEnd('\') -ieq $normalized) { return $true }
+    }
+    return $false
+}
+
+# ============================================
+# Helper: Safely append a directory to a PATH
+# string without leading/trailing semicolons.
+# ============================================
+function Add-ToPathString {
+    param([string]$PathString, [string]$Dir)
+    $tokens = @($PathString -split ';' | Where-Object { $_.Trim() -ne '' })
+    $tokens += $Dir
+    return $tokens -join ';'
+}
+
+# ============================================
+# Helper: Persist User PATH to registry, verify
+# the write, and broadcast WM_SETTINGCHANGE so
+# all running processes pick up the change.
+# ============================================
+function Set-PersistentUserPath {
+    param([string]$NewPath)
+
+    Write-Status "Writing updated PATH to registry (HKCU\Environment)..."
+
+    try {
+        # Write to registry
+        [Environment]::SetEnvironmentVariable('PATH', $NewPath, 'User')
+
+        # Verify the write
+        $written = [Environment]::GetEnvironmentVariable('PATH', 'User')
+        if ($written -eq $NewPath) {
+            Write-Success "Registry write verified successfully."
+        } else {
+            Write-Warning "Registry value differs from what was written - attempting direct registry write..."
+            # Direct registry fallback
+            $regKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+            if ($regKey) {
+                $regKey.SetValue('PATH', $NewPath, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+                $regKey.Close()
+                Write-Success "Direct registry write succeeded."
+            }
+        }
+    } catch {
+        Write-Warning "SetEnvironmentVariable failed: $_"
+        Write-Status "Attempting direct registry write as fallback..."
+        try {
+            $regKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+            if ($regKey) {
+                $regKey.SetValue('PATH', $NewPath, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+                $regKey.Close()
+                Write-Success "Direct registry write succeeded."
+            }
+        } catch {
+            Write-Warning "Direct registry write also failed: $_"
+        }
+    }
+
+    # Broadcast WM_SETTINGCHANGE so Explorer + new terminals pick up the change immediately
+    Write-Status "Broadcasting WM_SETTINGCHANGE to notify running processes..."
+    try {
+        if (-not ('WinEnv.Broadcaster' -as [type])) {
+            Add-Type -Namespace WinEnv -Name Broadcaster -MemberDefinition @'
+[DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)]
+public static extern IntPtr SendMessageTimeout(
+    IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam,
+    uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+'@
+        }
+        $result = [UIntPtr]::Zero
+        [WinEnv.Broadcaster]::SendMessageTimeout(
+            [IntPtr]0xffff, 0x001A, [UIntPtr]::Zero, 'Environment',
+            2, 5000, [ref]$result
+        ) | Out-Null
+        Write-Success "WM_SETTINGCHANGE broadcast sent — new terminals will see updated PATH."
+    } catch {
+        Write-Warning "WM_SETTINGCHANGE broadcast failed (non-critical): $_"
+    }
 }
 
 # ============================================
@@ -454,17 +546,22 @@ try {
 # Finds every Python installation on the system
 # and adds its root dir + Scripts dir to PATH.
 # ============================================
-Write-Status "Scanning for all Python installations to update PATH..."
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Magenta
+Write-Host "   Step 3: Python PATH Configuration   " -ForegroundColor Magenta
+Write-Host "========================================" -ForegroundColor Magenta
+Write-Host ""
+Write-Status "Scanning for all Python installations on this system..."
 
 $allPythonInstalls = Find-AllPythonInstallations
 
-# Also capture the pip --user Scripts dir (may differ from install dir on MS Store / per-user pip)
+# --- pip --user-base (may be outside install dir, e.g. on MS Store Python) ---
 try {
     $userBase = & $pythonCmd -m site --user-base 2>$null
     if ($userBase) {
         $userScripts = Join-Path $userBase 'Scripts'
-        # Build a synthetic entry so it goes through the same loop
         if (Test-Path $userScripts) {
+            Write-Status "[pip --user-base] Scripts dir: $userScripts"
             $allPythonInstalls.Add(@{
                 ExePath    = $pythonCmd
                 Dir        = $userBase
@@ -475,70 +572,139 @@ try {
     }
 } catch {}
 
-# Microsoft Store Python has its Scripts dir inside LocalCache, not the install root
+# --- Microsoft Store Python (Scripts inside LocalCache, not the install root) ---
 $msStorePkgs = Get-ChildItem "$env:LOCALAPPDATA\Packages" `
                -Filter 'PythonSoftwareFoundation.Python*' -Directory -ErrorAction SilentlyContinue
 foreach ($pkg in $msStorePkgs) {
-    $pattern = Join-Path $pkg.FullName 'LocalCache\local-packages\Python*\Scripts'
+    $pattern  = Join-Path $pkg.FullName 'LocalCache\local-packages\Python*\Scripts'
     $resolved = Get-ChildItem $pattern -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($resolved) {
+        Write-Status "[MS Store] Scripts dir: $($resolved.FullName)"
         $allPythonInstalls.Add(@{
             ExePath    = ''
-            Dir        = $resolved.FullName   # treat Scripts itself as the dir to add
+            Dir        = $resolved.FullName
             ScriptsDir = $resolved.FullName
             Source     = "MS Store: $($pkg.Name)"
         })
     }
 }
 
+# --- Summary of discoveries ---
+Write-Host ""
 if ($allPythonInstalls.Count -eq 0) {
-    Write-Warning "No Python installations found by broad scan — PATH may need manual update."
+    Write-Warning "No Python installations found by broad scan."
+    Write-Warning "PATH may need to be updated manually."
 } else {
     Write-Success "Found $($allPythonInstalls.Count) Python installation(s):"
     foreach ($inst in $allPythonInstalls) {
-        Write-Status "  $($inst.Source)  =>  $($inst.Dir)"
+        Write-Host "    Source : $($inst.Source)" -ForegroundColor Cyan
+        Write-Host "    Dir    : $($inst.Dir)" -ForegroundColor White
+        Write-Host "    Scripts: $($inst.ScriptsDir)" -ForegroundColor White
+        Write-Host ""
     }
 }
 
+# --- Snapshot current PATH state ---
 $machinePath     = [Environment]::GetEnvironmentVariable('PATH', 'Machine')
 $currentUserPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
 if (-not $currentUserPath) { $currentUserPath = '' }
-$pathsAdded = @()
+
+Write-Host "" 
+Write-Host "--- Current PATH Snapshot ---" -ForegroundColor DarkCyan
+Write-Host "Machine PATH entries:" -ForegroundColor DarkCyan
+($machinePath -split ';' | Where-Object { $_ }) | ForEach-Object { Write-Host "  [M] $_" -ForegroundColor DarkGray }
+Write-Host "User PATH entries:" -ForegroundColor DarkCyan
+if ($currentUserPath) {
+    ($currentUserPath -split ';' | Where-Object { $_ }) | ForEach-Object { Write-Host "  [U] $_" -ForegroundColor DarkGray }
+} else {
+    Write-Host "  [U] (empty)" -ForegroundColor DarkGray
+}
+Write-Host ""
+
+$pathsAdded    = [System.Collections.Generic.List[string]]::new()
+$pathsSkipped  = [System.Collections.Generic.List[string]]::new()
 
 foreach ($inst in $allPythonInstalls) {
-    foreach ($candidate in @($inst.Dir, $inst.ScriptsDir)) {
-        if (-not $candidate -or -not (Test-Path $candidate)) { continue }
+    Write-Status "Processing: $($inst.Source)"
 
-        # Inject into the current session immediately
-        if ($env:PATH -notlike "*$candidate*") {
-            $env:PATH = "$candidate;$env:PATH"
+    foreach ($candidate in @($inst.Dir, $inst.ScriptsDir)) {
+        if (-not $candidate -or -not (Test-Path $candidate)) {
+            if ($candidate) {
+                Write-Host "    [SKIP] Does not exist: $candidate" -ForegroundColor DarkGray
+            }
+            continue
         }
 
-        # Persist to User PATH if not already in Machine or User PATH
-        if ($machinePath -notlike "*$candidate*" -and $currentUserPath -notlike "*$candidate*") {
-            $currentUserPath = $currentUserPath.TrimEnd(';') + ";$candidate"
-            $pathsAdded += $candidate
+        $inMachine = Test-PathContains -PathString $machinePath     -Dir $candidate
+        $inUser    = Test-PathContains -PathString $currentUserPath  -Dir $candidate
+        $inSession = Test-PathContains -PathString $env:PATH         -Dir $candidate
+
+        # Always inject into the current session
+        if (-not $inSession) {
+            $env:PATH = "$candidate;$env:PATH"
+            Write-Host "    [SESSION+] $candidate" -ForegroundColor Green
+        } else {
+            Write-Host "    [SESSION ] Already in session PATH: $candidate" -ForegroundColor DarkGray
+        }
+
+        if ($inMachine) {
+            Write-Host "    [SKIP-M ] Already in Machine PATH: $candidate" -ForegroundColor DarkGray
+            $pathsSkipped.Add($candidate) | Out-Null
+        } elseif ($inUser) {
+            Write-Host "    [SKIP-U ] Already in User PATH: $candidate" -ForegroundColor DarkGray
+            $pathsSkipped.Add($candidate) | Out-Null
+        } else {
+            # Safe append: no leading/trailing semicolons
+            $currentUserPath = Add-ToPathString -PathString $currentUserPath -Dir $candidate
+            $pathsAdded.Add($candidate) | Out-Null
+            Write-Host "    [ADD+   ] Queued for User PATH: $candidate" -ForegroundColor Yellow
         }
     }
 
-    # Report Frida tools if found in ScriptsDir
+    # Report Frida tools in this installation's Scripts dir
     if ($inst.ScriptsDir -and (Test-Path $inst.ScriptsDir)) {
         $fridaExe = Get-ChildItem $inst.ScriptsDir -Filter 'frida*' -ErrorAction SilentlyContinue
         if ($fridaExe) {
-            Write-Success "Found Frida tools in: $($inst.ScriptsDir) [$($inst.Source)]"
+            Write-Success "    [FRIDA ] Found: $($fridaExe.Name -join ', ') in $($inst.ScriptsDir)"
         }
     }
+    Write-Host ""
 }
+
+# --- Persist changes ---
+Write-Host "--- PATH Update Summary ---" -ForegroundColor DarkCyan
+Write-Host "  Paths already present (skipped): $($pathsSkipped.Count)" -ForegroundColor DarkGray
+Write-Host "  New paths to persist           : $($pathsAdded.Count)" -ForegroundColor $(if ($pathsAdded.Count -gt 0) { 'Yellow' } else { 'DarkGray' })
+Write-Host ""
 
 if ($pathsAdded.Count -gt 0) {
-    [Environment]::SetEnvironmentVariable('PATH', $currentUserPath, 'User')
-    Write-Success "Persisted $($pathsAdded.Count) new path(s) to User PATH:"
-    foreach ($p in $pathsAdded) { Write-Status "  + $p" }
-    Write-Warning "Open a new terminal to pick up the persisted PATH changes."
+    Write-Host "  Paths being added to User PATH:" -ForegroundColor Yellow
+    foreach ($p in $pathsAdded) { Write-Host "    + $p" -ForegroundColor Yellow }
+    Write-Host ""
+
+    # Sanity-check PATH length (Windows hard limit is 32767 chars; warn above 4096)
+    if ($currentUserPath.Length -gt 4096) {
+        Write-Warning "User PATH is now $($currentUserPath.Length) chars. Consider cleaning up old entries."
+    }
+
+    Set-PersistentUserPath -NewPath $currentUserPath
+
+    # Verify by reading back from registry
+    Write-Host ""
+    Write-Status "Verifying final User PATH entries in registry:"
+    $finalPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+    foreach ($p in $pathsAdded) {
+        if (Test-PathContains -PathString $finalPath -Dir $p) {
+            Write-Host "    [OK] $p" -ForegroundColor Green
+        } else {
+            Write-Host "    [MISSING] $p  <-- NOT found in registry after write!" -ForegroundColor Red
+        }
+    }
 } else {
-    Write-Success "All Python paths already present in PATH — nothing to add."
+    Write-Success "All Python paths are already present in PATH. Nothing to persist."
 }
 
+Write-Host ""
 # Final registry-level PATH refresh for this session
 Refresh-EnvironmentPath
 
