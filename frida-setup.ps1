@@ -30,6 +30,124 @@ function Write-Success { param($Message) Write-Host "[+] $Message" -ForegroundCo
 function Write-Error { param($Message) Write-Host "[-] $Message" -ForegroundColor Red }
 function Write-Warning { param($Message) Write-Host "[!] $Message" -ForegroundColor Yellow }
 
+# ============================================
+# Helper Function: Refresh PATH from registry
+# ============================================
+function Refresh-EnvironmentPath {
+    $machinePath = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
+    $userPath    = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+    $env:PATH    = "$machinePath;$userPath"
+}
+
+# ============================================
+# Helper Function: Broad Python Installation Finder
+# Queries Windows Registry (HKLM + HKCU, 32/64-bit)
+# then sweeps every common filesystem location.
+# Returns array of @{ ExePath; Dir; ScriptsDir; Source }
+# ============================================
+function Find-AllPythonInstallations {
+    $installs  = [System.Collections.Generic.List[hashtable]]::new()
+    $seenDirs  = @{}
+
+    # ---- helper: register a candidate python.exe ----
+    $register = {
+        param($exePath, $source)
+        $dir = Split-Path $exePath
+        if ($seenDirs[$dir]) { return }
+        if (-not (Test-Path $exePath)) { return }
+        try {
+            $v = & $exePath --version 2>&1
+            if ($v -match 'Python 3') {
+                $seenDirs[$dir] = $true
+                $installs.Add(@{
+                    ExePath    = $exePath
+                    Dir        = $dir
+                    ScriptsDir = Join-Path $dir 'Scripts'
+                    Source     = $source
+                })
+            }
+        } catch {}
+    }
+
+    # --------------------------------------------------
+    # 1. Windows Registry  (most authoritative)
+    # --------------------------------------------------
+    $regPaths = @(
+        'HKLM:\SOFTWARE\Python\PythonCore',              # 64-bit installs
+        'HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore',  # 32-bit installs on 64-bit OS
+        'HKCU:\SOFTWARE\Python\PythonCore'               # per-user installs
+    )
+    foreach ($regRoot in $regPaths) {
+        if (-not (Test-Path $regRoot)) { continue }
+        foreach ($verKey in (Get-ChildItem $regRoot -ErrorAction SilentlyContinue)) {
+            # InstallPath key holds the directory
+            $ipKey = "$($verKey.PSPath)\InstallPath"
+            if (-not (Test-Path $ipKey)) { continue }
+            $ip = Get-ItemProperty $ipKey -ErrorAction SilentlyContinue
+            # '(default)' property or ExecutablePath
+            $dir = $ip.'(default)'
+            if (-not $dir -and $ip.ExecutablePath) { $dir = Split-Path $ip.ExecutablePath }
+            if ($dir) {
+                & $register (Join-Path $dir 'python.exe') "Registry: $regRoot"
+                & $register (Join-Path $dir 'python3.exe') "Registry: $regRoot"
+            }
+        }
+    }
+
+    # --------------------------------------------------
+    # 2. Filesystem sweep
+    # --------------------------------------------------
+    # Each entry: @(root, filter)  — filter '' means check root itself directly
+    $locations = @(
+        # Standard CPython user installer
+        @("$env:LOCALAPPDATA\Programs\Python", 'Python*'),
+        # All-users CPython installer
+        @($env:PROGRAMFILES,                   'Python*'),
+        @(${env:PROGRAMFILES(x86)},            'Python*'),
+        # Old-style C:\Python3x
+        @('C:\',                               'Python3*'),
+        @('C:\',                               'Python*'),
+        # Scoop
+        @("$env:USERPROFILE\scoop\apps\python\current", ''),
+        @("$env:USERPROFILE\scoop\apps\python3\current", ''),
+        # Chocolatey
+        @('C:\tools',                          'python*'),
+        @('C:\ProgramData\chocolatey\lib',     'python*'),
+        # Conda / Miniconda / Mamba
+        @("$env:USERPROFILE\anaconda3",        ''),
+        @("$env:USERPROFILE\miniconda3",       ''),
+        @("$env:USERPROFILE\mambaforge",       ''),
+        @('C:\ProgramData\Anaconda3',          ''),
+        @('C:\ProgramData\Miniconda3',         ''),
+        @("$env:USERPROFILE\.conda\envs",      '*'),
+        # pyenv-win
+        @("$env:USERPROFILE\.pyenv\pyenv-win\versions", '*'),
+        # Roaming AppData pip --user layout
+        @("$env:APPDATA\Python",               'Python*')
+    )
+
+    foreach ($loc in $locations) {
+        $root   = $loc[0]
+        $filter = $loc[1]
+        if (-not $root -or -not (Test-Path $root)) { continue }
+
+        if ($filter -eq '') {
+            # root is itself a Python install dir
+            & $register (Join-Path $root 'python.exe')  "Filesystem: $root"
+            & $register (Join-Path $root 'python3.exe') "Filesystem: $root"
+        } else {
+            $subdirs = Get-ChildItem $root -Filter $filter -Directory -ErrorAction SilentlyContinue |
+                       Sort-Object Name -Descending
+            foreach ($sub in $subdirs) {
+                & $register (Join-Path $sub.FullName 'python.exe')  "Filesystem: $($sub.FullName)"
+                & $register (Join-Path $sub.FullName 'python3.exe') "Filesystem: $($sub.FullName)"
+            }
+        }
+    }
+
+    return $installs
+}
+
 # Configuration
 $DocumentsFolder = [Environment]::GetFolderPath("MyDocuments")
 $PlatformToolsPath = Join-Path $DocumentsFolder "platform-tools"
@@ -132,17 +250,28 @@ Write-Host ""
 Write-Status "Checking Python installation..."
 
 function Find-Python {
-    $pythonPaths = @("python", "python3", "py")
-    foreach ($cmd in $pythonPaths) {
+    # 1. Try commands already in PATH (python3 first, then python, then py launcher)
+    foreach ($cmd in @('python3', 'python', 'py')) {
         try {
-            $version = & $cmd --version 2>&1
-            if ($version -match "Python \d+\.\d+") {
-                return @{ Command = $cmd; Version = $version }
-            }
-        } catch {
-            continue
-        }
+            $v = & $cmd --version 2>&1
+            if ($v -match 'Python 3') { return @{ Command = $cmd; Version = $v } }
+        } catch { continue }
     }
+
+    # 2. Broad registry + filesystem scan (handles any broken/missing PATH)
+    Write-Status "Python not in PATH — running broad installation scan..."
+    $all = Find-AllPythonInstallations
+    if ($all.Count -gt 0) {
+        # Pick the highest version (sort by exe directory name descending)
+        $best = $all | Sort-Object { $_.Dir } -Descending | Select-Object -First 1
+        if ($env:PATH -notlike "*$($best.Dir)*") {
+            $env:PATH = "$($best.Dir);$env:PATH"
+            Write-Status "Injected Python dir into session PATH: $($best.Dir) [$($best.Source)]"
+        }
+        $v = & $best.ExePath --version 2>&1
+        return @{ Command = $best.ExePath; Version = $v }
+    }
+
     return $null
 }
 
@@ -256,7 +385,9 @@ if (-not $pythonInfo) {
     $installed = Install-Python
 
     if ($installed) {
-        # Wait a moment for PATH to be available
+        # Refresh PATH from registry so newly added entries are visible, then scan again
+        Write-Status "Refreshing PATH from registry after Python installation..."
+        Refresh-EnvironmentPath
         Start-Sleep -Seconds 2
         $pythonInfo = Find-Python
     }
@@ -319,67 +450,97 @@ try {
 }
 
 # ============================================
-# Step 3: Add Python Scripts to PATH
+# Step 3: Broad Python PATH Setup
+# Finds every Python installation on the system
+# and adds its root dir + Scripts dir to PATH.
 # ============================================
-Write-Status "Checking Python Scripts PATH..."
+Write-Status "Scanning for all Python installations to update PATH..."
 
-# Find Python Scripts folder
-$pythonScriptsPaths = @()
+$allPythonInstalls = Find-AllPythonInstallations
 
-# Check for Microsoft Store Python
-$msStorePythonPaths = Get-ChildItem "$env:LOCALAPPDATA\Packages" -Filter "PythonSoftwareFoundation.Python*" -Directory -ErrorAction SilentlyContinue
-foreach ($path in $msStorePythonPaths) {
-    $scriptsPath = Join-Path $path.FullName "LocalCache\local-packages\Python*\Scripts"
-    $resolved = Get-ChildItem $scriptsPath -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+# Also capture the pip --user Scripts dir (may differ from install dir on MS Store / per-user pip)
+try {
+    $userBase = & $pythonCmd -m site --user-base 2>$null
+    if ($userBase) {
+        $userScripts = Join-Path $userBase 'Scripts'
+        # Build a synthetic entry so it goes through the same loop
+        if (Test-Path $userScripts) {
+            $allPythonInstalls.Add(@{
+                ExePath    = $pythonCmd
+                Dir        = $userBase
+                ScriptsDir = $userScripts
+                Source     = 'pip --user-base'
+            })
+        }
+    }
+} catch {}
+
+# Microsoft Store Python has its Scripts dir inside LocalCache, not the install root
+$msStorePkgs = Get-ChildItem "$env:LOCALAPPDATA\Packages" `
+               -Filter 'PythonSoftwareFoundation.Python*' -Directory -ErrorAction SilentlyContinue
+foreach ($pkg in $msStorePkgs) {
+    $pattern = Join-Path $pkg.FullName 'LocalCache\local-packages\Python*\Scripts'
+    $resolved = Get-ChildItem $pattern -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($resolved) {
-        $pythonScriptsPaths += $resolved.FullName
+        $allPythonInstalls.Add(@{
+            ExePath    = ''
+            Dir        = $resolved.FullName   # treat Scripts itself as the dir to add
+            ScriptsDir = $resolved.FullName
+            Source     = "MS Store: $($pkg.Name)"
+        })
     }
 }
 
-# Check for standard Python installation
-$standardPythonPath = Join-Path $env:APPDATA "Python\Python*\Scripts"
-$resolved = Get-ChildItem $standardPythonPath -Directory -ErrorAction SilentlyContinue
-foreach ($p in $resolved) {
-    $pythonScriptsPaths += $p.FullName
-}
-
-# Also check user site-packages scripts
-$userBase = & $pythonCmd -m site --user-base 2>$null
-if ($userBase) {
-    $userScripts = Join-Path $userBase "Scripts"
-    if (Test-Path $userScripts) {
-        $pythonScriptsPaths += $userScripts
+if ($allPythonInstalls.Count -eq 0) {
+    Write-Warning "No Python installations found by broad scan — PATH may need manual update."
+} else {
+    Write-Success "Found $($allPythonInstalls.Count) Python installation(s):"
+    foreach ($inst in $allPythonInstalls) {
+        Write-Status "  $($inst.Source)  =>  $($inst.Dir)"
     }
 }
 
+$machinePath     = [Environment]::GetEnvironmentVariable('PATH', 'Machine')
 $currentUserPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+if (-not $currentUserPath) { $currentUserPath = '' }
 $pathsAdded = @()
 
-foreach ($scriptsPath in $pythonScriptsPaths) {
-    if (Test-Path $scriptsPath) {
-        # Check if frida executables exist here
-        $fridaExe = Get-ChildItem $scriptsPath -Filter "frida*" -ErrorAction SilentlyContinue
-        if ($fridaExe) {
-            Write-Success "Found Frida tools in: $scriptsPath"
+foreach ($inst in $allPythonInstalls) {
+    foreach ($candidate in @($inst.Dir, $inst.ScriptsDir)) {
+        if (-not $candidate -or -not (Test-Path $candidate)) { continue }
 
-            if (-not $currentUserPath.Contains($scriptsPath)) {
-                $currentUserPath = $currentUserPath.TrimEnd(';') + ";$scriptsPath"
-                $pathsAdded += $scriptsPath
-            } else {
-                Write-Status "Path already in USER PATH: $scriptsPath"
-            }
+        # Inject into the current session immediately
+        if ($env:PATH -notlike "*$candidate*") {
+            $env:PATH = "$candidate;$env:PATH"
+        }
+
+        # Persist to User PATH if not already in Machine or User PATH
+        if ($machinePath -notlike "*$candidate*" -and $currentUserPath -notlike "*$candidate*") {
+            $currentUserPath = $currentUserPath.TrimEnd(';') + ";$candidate"
+            $pathsAdded += $candidate
+        }
+    }
+
+    # Report Frida tools if found in ScriptsDir
+    if ($inst.ScriptsDir -and (Test-Path $inst.ScriptsDir)) {
+        $fridaExe = Get-ChildItem $inst.ScriptsDir -Filter 'frida*' -ErrorAction SilentlyContinue
+        if ($fridaExe) {
+            Write-Success "Found Frida tools in: $($inst.ScriptsDir) [$($inst.Source)]"
         }
     }
 }
 
 if ($pathsAdded.Count -gt 0) {
     [Environment]::SetEnvironmentVariable('PATH', $currentUserPath, 'User')
-    Write-Success "Added to USER PATH: $($pathsAdded -join ', ')"
-    Write-Warning "Please open a new terminal to use the updated PATH"
+    Write-Success "Persisted $($pathsAdded.Count) new path(s) to User PATH:"
+    foreach ($p in $pathsAdded) { Write-Status "  + $p" }
+    Write-Warning "Open a new terminal to pick up the persisted PATH changes."
+} else {
+    Write-Success "All Python paths already present in PATH — nothing to add."
 }
 
-# Update current session PATH
-$env:PATH = [Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('PATH', 'User')
+# Final registry-level PATH refresh for this session
+Refresh-EnvironmentPath
 
 # ============================================
 # Step 4: Download and Install Platform Tools
