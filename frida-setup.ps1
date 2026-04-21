@@ -113,22 +113,24 @@ function Set-PersistentUserPath {
     Write-Status "Broadcasting WM_SETTINGCHANGE to notify running processes..."
     try {
         if (-not ('WinEnv.Broadcaster' -as [type])) {
-            Add-Type -Namespace WinEnv -Name Broadcaster -MemberDefinition @'
-[DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)]
-public static extern IntPtr SendMessageTimeout(
-    IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam,
-    uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
-'@
+            # Build the C# member definition without a here-string (here-strings require
+            # the closing '@ at absolute column 0, which breaks with tool indentation).
+            $memberDef = '[DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)] ' +
+                         'public static extern IntPtr SendMessageTimeout(' +
+                         'IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, ' +
+                         'uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
+            Add-Type -Namespace WinEnv -Name Broadcaster -MemberDefinition $memberDef
         }
         $result = [UIntPtr]::Zero
         [WinEnv.Broadcaster]::SendMessageTimeout(
             [IntPtr]0xffff, 0x001A, [UIntPtr]::Zero, 'Environment',
             2, 5000, [ref]$result
         ) | Out-Null
-        Write-Success "WM_SETTINGCHANGE broadcast sent — new terminals will see updated PATH."
+        Write-Success "WM_SETTINGCHANGE broadcast sent - new terminals will see updated PATH."
     } catch {
         Write-Warning "WM_SETTINGCHANGE broadcast failed (non-critical): $_"
     }
+
 }
 
 # ============================================
